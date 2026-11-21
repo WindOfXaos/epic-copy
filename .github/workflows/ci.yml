@@ -1,11 +1,10 @@
 name: CI
 
-# Build and test every pull request (and pushes to branches other than master,
-# which the release workflow covers) on the same platform the app ships for.
+# Build and test every pull request on the same platform the app ships for.
+# (master is covered by the release workflow, which runs the same steps.)
 on:
   pull_request:
-  push:
-    branches-ignore: [master]
+  workflow_dispatch:
 
 permissions:
   contents: read

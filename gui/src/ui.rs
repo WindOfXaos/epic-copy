@@ -275,28 +275,34 @@ struct Layout {
     compact: bool,
     sidebar_w: f32,
     pad: f32,
-    /// Game panel above the content instead of beside it.
+    /// Game panel above the content instead of in its own column.
     stacked: bool,
-    panel_w: f32,
+    /// Width of the full-height game column on the right.
+    side_w: f32,
+    height: f32,
     heading: f32,
 }
 
-/// Widest the content gets: a readable text column plus the game panel.
-const MAX_CONTENT: f32 = 1100.;
+/// Height of the floating title bar; columns start their content below it.
+const TITLEBAR: f32 = 32.;
+/// Longest comfortable line for paragraphs.
+const READABLE: f32 = 880.;
 
 impl Layout {
-    fn for_width(width: f32) -> Self {
+    fn new(width: f32, height: f32) -> Self {
         let compact = width < 1000.;
         let sidebar_w = if compact { 76. } else { 260. };
         let pad = if width < 900. { 24. } else { 40. };
-        let content = (width - sidebar_w - 2. * pad).min(MAX_CONTENT);
-        let stacked = content < 760.;
+        let side_w = (width * 0.26).clamp(300., 460.);
+        let stacked = width - sidebar_w - side_w - 2. * pad < 520.;
+        let content = width - sidebar_w - 2. * pad - if stacked { 0. } else { side_w };
         Layout {
             compact,
             sidebar_w,
             pad,
             stacked,
-            panel_w: if stacked { 0. } else { (content * 0.3).clamp(250., 340.) },
+            side_w,
+            height,
             heading: if content < 640. { 30. } else { 40. },
         }
     }
@@ -712,10 +718,13 @@ impl Wizard {
                 .window_control_area(area)
                 .child(glyph.to_string())
         };
+        // Floats over the columns so the side panel's background reaches the top.
         div()
+            .absolute()
+            .top_0()
+            .left_0()
             .flex()
-            .flex_none()
-            .h(px(32.))
+            .h(px(TITLEBAR))
             .w_full()
             .child(div().flex_1().h_full().window_control_area(WindowControlArea::Drag))
             .child(caption("min", I_MIN, WindowControlArea::Min, HOVER))
@@ -842,6 +851,7 @@ impl Wizard {
             .w(px(layout.sidebar_w))
             .flex_none()
             .h_full()
+            .pt(px(TITLEBAR))
             .px_3()
             .pb_5()
             .child(
@@ -914,7 +924,7 @@ impl Wizard {
 
     /// The game's tile and where it's going, like a library card. Beside the
     /// content on wide windows, a compact card above it on narrow ones.
-    fn render_game_panel(&self, install: &PendingInstall, layout: Layout) -> Div {
+    fn render_game_panel(&self, install: &PendingInstall, layout: Layout) -> Stateful<Div> {
         let image = self.cover_path(install);
         if layout.stacked {
             let (glyph, status, status_color) = self.game_status();
@@ -923,6 +933,7 @@ impl Wizard {
                 facts.push(format_bytes(size));
             }
             return div()
+                .id("game-card")
                 .flex()
                 .items_center()
                 .gap_4()
@@ -955,23 +966,37 @@ impl Wizard {
                         }),
                 );
         }
-        let w = layout.panel_w;
+        // A full-height column on the right, like the launcher's side panels.
+        // The cover lines up with the status pill at the top.
+        const SIDE_PAD: f32 = 24.;
+        let w = layout.side_w - 2. * SIDE_PAD;
+        let h = (w * 4. / 3.).min(layout.height * 0.55).max(w * 0.75);
         div()
+            .id("game-panel")
             .flex()
             .flex_col()
             .gap_4()
-            .w(px(w))
+            .w(px(layout.side_w))
             .flex_none()
+            .h_full()
+            .overflow_y_scroll()
+            .px(px(SIDE_PAD))
+            .pt(px(TITLEBAR + 6.))
+            .pb(px(SIDE_PAD))
+            .bg(rgb(SURFACE))
+            .border_l_1()
+            .border_color(rgb(BORDER))
             // Portrait, like the launcher's library covers.
-            .child(cover(&install.display_name, image, w, w * 4. / 3.))
-            .child(self.game_title(install, 18.))
+            .child(cover(&install.display_name, image, w, h))
+            .child(self.game_title(install, 20.))
             .child(self.game_details(install))
     }
 }
 
 impl Render for Wizard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let layout = Layout::for_width(f32::from(window.viewport_size().width));
+        let viewport = window.viewport_size();
+        let layout = Layout::new(f32::from(viewport.width), f32::from(viewport.height));
         let screen = match self.finished.clone() {
             Some(name) => self.render_done(&name, cx),
             None => match self.current_step() {
@@ -989,19 +1014,11 @@ impl Render for Wizard {
             (STEP_ICONS[step.min(4)], format!("Step {} of {}  \u{00b7}  {}", step + 1, STEPS.len(), STEPS[step.min(4)]))
         };
         let game_panel = self.install().cloned().map(|install| self.render_game_panel(&install, layout));
-        let (panel_above, panel_beside) = if layout.stacked { (game_panel, None) } else { (None, game_panel) };
+        let (panel_above, panel_side) = if layout.stacked { (game_panel, None) } else { (None, game_panel) };
 
-        let text_column = div()
-            .flex()
-            .flex_col()
-            .gap_6()
-            .flex_1()
-            .min_w_0()
-            .children(panel_above)
-            .children(screen.subtitle.map(para))
-            .child(screen.body);
-
-        let main: AnyElement = div()
+        // Content starts right next to the sidebar and fills the space up to
+        // the game column; only paragraphs keep a readable line length.
+        let main = div()
             .id("main")
             .flex_1()
             .min_w_0()
@@ -1012,9 +1029,8 @@ impl Render for Wizard {
                     .flex()
                     .flex_col()
                     .w_full()
-                    .max_w(px(MAX_CONTENT + 2. * layout.pad))
-                    .mx_auto()
                     .px(px(layout.pad))
+                    .pt(px(TITLEBAR))
                     .pb_10()
                     .child(
                         // Status pill where the launcher has its search box.
@@ -1045,21 +1061,23 @@ impl Render for Wizard {
                         div()
                             .mt_6()
                             .flex()
-                            .gap_10()
-                            .items_start()
-                            .child(text_column)
-                            .children(panel_beside),
+                            .flex_col()
+                            .gap_6()
+                            .children(panel_above)
+                            .children(screen.subtitle.map(|s| para(s).max_w(px(READABLE))))
+                            .child(screen.body),
                     ),
-            )
-            .into_any_element();
+            );
 
         div()
+            .relative()
             .size_full()
             .flex()
-            .flex_col()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
+            .child(self.render_sidebar(layout))
+            .child(main)
+            .children(panel_side)
             .child(self.render_titlebar(window))
-            .child(div().flex().flex_1().min_h_0().child(self.render_sidebar(layout)).child(main))
     }
 }

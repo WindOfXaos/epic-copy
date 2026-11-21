@@ -980,7 +980,7 @@ impl Wizard {
         // Portrait 3:4 like the launcher's library covers. Images always keep
         // their aspect ratio, so when the window is too short for a full-width
         // cover plus the title and details, use a small cover beside the title.
-        let full_cover_fits = top + w * 4. / 3. + 300. <= layout.height;
+        let full_cover_fits = top + w * 4. / 3. + self.details_height(install, w) <= layout.height;
         let header = if full_cover_fits {
             div()
                 .flex()
@@ -998,24 +998,53 @@ impl Wizard {
                 .child(cover(&install.display_name, image, 96., 128.))
                 .child(self.game_title(install, 18.).flex_1().min_w_0())
         };
+        // The gap above the cover is outside the scroll area, so anything
+        // scrolled up is clipped below the title bar instead of sliding under it.
         div()
             .id("game-panel")
             .flex()
             .flex_col()
-            .gap_4()
             .w(px(layout.side_w))
             .flex_none()
             .h_full()
-            .overflow_y_scroll()
-            .px(px(SIDE_PAD))
             .pt(px(top))
-            .pb(px(SIDE_PAD))
             .bg(rgb(SURFACE))
             .border_l_1()
             .border_color(rgb(BORDER))
-            // Children keep their size; the column scrolls instead of squashing them.
-            .child(header)
-            .child(self.game_details(install).flex_none())
+            .child(
+                div()
+                    .id("game-panel-scroll")
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .px(px(SIDE_PAD))
+                    .pb(px(SIDE_PAD))
+                    // Children keep their size; the column scrolls instead of squashing them.
+                    .child(header)
+                    .child(self.game_details(install).flex_none()),
+            )
+    }
+
+    /// Roughly how tall the title, status and details under the cover are,
+    /// to decide whether a full-width cover fits without scrolling.
+    fn details_height(&self, install: &PendingInstall, width: f32) -> f32 {
+        // ~7.5px per character at 14px; rows whose value wraps get a second line.
+        let row = |value: &str| if value.chars().count() as f32 * 7.5 > width - 32. { 94. } else { 72. };
+        let mut height = row(&short_path(&install.install_location));
+        if install.expected_size.is_some() {
+            height += 72.;
+        }
+        if let Some(source) = self.source.as_ref().filter(|s| !s.in_place) {
+            height += row(&short_path(&source.path));
+        }
+        if matches!(self.copy, CopyState::Done(_)) {
+            height += 72.;
+        }
+        // Title + status, the gaps between blocks, and bottom padding.
+        height + 64. + 2. * 16. + 24.
     }
 }
 
@@ -1044,19 +1073,14 @@ impl Render for Wizard {
 
         // Content starts right next to the sidebar and fills the space up to
         // the game column; only paragraphs keep a readable line length.
-        let main = div()
-            .id("main")
-            .flex_1()
-            .min_w_0()
-            .h_full()
-            .overflow_y_scroll()
-            .child(
+        // Like the game column, the scroll area starts below the title bar.
+        let main = div().flex().flex_col().flex_1().min_w_0().h_full().pt(px(TITLEBAR)).child(
+            div().id("main").flex_1().min_h_0().overflow_y_scroll().child(
                 div()
                     .flex()
                     .flex_col()
                     .w_full()
                     .px(px(layout.pad))
-                    .pt(px(TITLEBAR))
                     .pb_10()
                     .child(
                         // Status pill where the launcher has its search box.
@@ -1093,7 +1117,8 @@ impl Render for Wizard {
                             .children(screen.subtitle.map(|s| para(s).max_w(px(READABLE))))
                             .child(screen.body),
                     ),
-            );
+            ),
+        );
 
         div()
             .relative()

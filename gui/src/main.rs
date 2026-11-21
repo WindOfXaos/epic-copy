@@ -116,12 +116,30 @@ enum Cover {
     Ready(Option<PathBuf>),
 }
 
+/// Wizard progress for a game that isn't the selected one right now, so
+/// switching between games loses nothing.
+struct GameProgress {
+    source: Option<Source>,
+    warnings_accepted: bool,
+    copy: CopyState,
+    finish_error: Option<String>,
+}
+
 struct Wizard {
     manifests_dir: PathBuf,
+    /// Every unfinished download in the launcher, and what's on disk for each.
     installs: Vec<PendingInstall>,
+    plans: HashMap<PathBuf, Plan>,
     scan_error: Option<String>,
+    /// The game the wizard is working on (its `.item` path). The fields
+    /// `plan`, `source`, `warnings_accepted`, `copy` and `finish_error`
+    /// belong to it; other games' progress waits in `games`.
     selected: Option<PathBuf>,
     plan: Option<Plan>,
+    games: HashMap<PathBuf, GameProgress>,
+    /// Games finished in this session, and which one's done screen is shown.
+    done: Vec<PendingInstall>,
+    viewing_done: Option<usize>,
     launcher_running: bool,
     launcher_check: Option<Slot<bool>>,
     closing_launcher: Option<Slot<Result<(), String>>>,
@@ -130,7 +148,6 @@ struct Wizard {
     warnings_accepted: bool,
     copy: CopyState,
     finish_error: Option<String>,
-    finished: Option<String>,
     /// Cover art per catalog item ID.
     covers: HashMap<String, Cover>,
     ticks: u64,
@@ -141,9 +158,13 @@ impl Wizard {
         let mut this = Self {
             manifests_dir: epic::manifests_dir(),
             installs: Vec::new(),
+            plans: HashMap::new(),
             scan_error: None,
             selected: None,
             plan: None,
+            games: HashMap::new(),
+            done: Vec::new(),
+            viewing_done: None,
             launcher_running: epic::launcher_running(),
             launcher_check: None,
             closing_launcher: None,
@@ -152,7 +173,6 @@ impl Wizard {
             warnings_accepted: false,
             copy: CopyState::Idle,
             finish_error: None,
-            finished: None,
             covers: HashMap::new(),
             ticks: 0,
         };
@@ -233,43 +253,45 @@ impl Wizard {
 
     /// Picks up downloads started in the launcher and whether it is running.
     fn rescan(&mut self) {
-        if self.finished.is_some() {
-            return;
-        }
         if self.launcher_check.is_none() {
             self.launcher_check = Some(in_background(epic::launcher_running));
         }
         match epic::scan_pending(&self.manifests_dir) {
             Ok(installs) => {
+                self.plans = installs.iter().map(|i| (i.item_path.clone(), epic::plan(i))).collect();
                 self.installs = installs;
                 self.scan_error = None;
                 self.load_covers();
             }
             Err(e) => {
                 self.installs.clear();
+                self.plans.clear();
                 self.scan_error = Some(e);
             }
         }
-        let still_there = self
-            .selected
-            .as_ref()
-            .and_then(|sel| self.installs.iter().find(|i| &i.item_path == sel))
-            .cloned();
-        match still_there {
-            Some(install) => self.plan = Some(epic::plan(&install)),
-            None if self.installs.len() == 1 => {
+        // Forget progress for downloads that were removed in the launcher.
+        let plans = &self.plans;
+        self.games.retain(|item, _| plans.contains_key(item));
+
+        match self.selected.clone() {
+            Some(selected) => match self.plans.get(&selected) {
+                Some(plan) => self.plan = Some(plan.clone()),
+                None => self.clear_selected(),
+            },
+            // With a single download there's nothing to choose.
+            None if self.viewing_done.is_none() && self.installs.len() == 1 => {
                 let path = self.installs[0].item_path.clone();
                 self.select(path);
             }
-            None => {
-                if self.selected.is_some() {
-                    self.reset_selection();
-                }
-            }
+            None => {}
         }
     }
 
-    fn reset_selection(&mut self) {
+    fn copy_running(&self) -> bool {
+        matches!(self.copy, CopyState::Running { .. })
+    }
+
+    fn clear_selected(&mut self) {
         self.selected = None;
         self.plan = None;
         self.source = None;
@@ -278,12 +300,67 @@ impl Wizard {
         self.finish_error = None;
     }
 
-    fn select(&mut self, item_path: PathBuf) {
-        self.reset_selection();
-        if let Some(install) = self.installs.iter().find(|i| i.item_path == item_path) {
-            self.plan = Some(epic::plan(install));
-            self.selected = Some(item_path);
+    /// Parks the selected game's progress so another game can be shown.
+    fn stash_selected(&mut self) {
+        if let Some(item) = self.selected.clone() {
+            let progress = GameProgress {
+                source: self.source.take(),
+                warnings_accepted: self.warnings_accepted,
+                copy: std::mem::replace(&mut self.copy, CopyState::Idle),
+                finish_error: self.finish_error.take(),
+            };
+            self.games.insert(item, progress);
         }
+        self.clear_selected();
+    }
+
+    /// "Pick a different game": back to the list of downloads.
+    fn reset_selection(&mut self) {
+        if !self.copy_running() {
+            self.stash_selected();
+        }
+    }
+
+    /// Switches to a game, restoring where it was left. Not while copying.
+    fn select(&mut self, item_path: PathBuf) {
+        if self.copy_running() {
+            return;
+        }
+        self.stash_selected();
+        self.viewing_done = None;
+        let Some(plan) = self.plans.get(&item_path).cloned() else { return };
+        if let Some(progress) = self.games.remove(&item_path) {
+            self.source = progress.source;
+            self.warnings_accepted = progress.warnings_accepted;
+            self.copy = progress.copy;
+            self.finish_error = progress.finish_error;
+        }
+        self.plan = Some(plan);
+        self.selected = Some(item_path);
+    }
+
+    /// Shows the done screen of a game finished earlier in this session.
+    fn view_done(&mut self, index: usize) {
+        if self.copy_running() || index >= self.done.len() {
+            return;
+        }
+        self.stash_selected();
+        self.viewing_done = Some(index);
+    }
+
+    /// The finished game whose done screen is showing.
+    fn done_view(&self) -> Option<&PendingInstall> {
+        self.done.get(self.viewing_done?)
+    }
+
+    /// The game shown in the side panel: the selected one or a finished one.
+    fn shown_install(&self) -> Option<&PendingInstall> {
+        self.done_view().or_else(|| self.install())
+    }
+
+    /// Short status for a game in the sidebar list.
+    fn progress_of(&self, item: &Path) -> Option<&GameProgress> {
+        self.games.get(item)
     }
 
     fn install(&self) -> Option<&PendingInstall> {
@@ -480,14 +557,29 @@ impl Wizard {
             return;
         }
         match epic::apply(&plan, &mut |_| {}) {
-            Ok(()) => self.finished = Some(plan.install.display_name.clone()),
+            Ok(()) => {
+                // It's no longer a pending download: show its done screen and
+                // let the list offer the next one.
+                self.clear_selected();
+                self.done.push(plan.install);
+                self.viewing_done = Some(self.done.len() - 1);
+                self.rescan();
+            }
             Err(e) => self.finish_error = Some(e),
         }
     }
 
-    fn start_over(&mut self) {
-        self.finished = None;
-        self.reset_selection();
+    /// The download to suggest after finishing one.
+    fn next_pending(&self) -> Option<&PendingInstall> {
+        self.installs.first()
+    }
+
+    /// From a done screen: on to the next download, or back to step 1.
+    fn next_game(&mut self) {
+        self.viewing_done = None;
+        if let Some(next) = self.next_pending().map(|i| i.item_path.clone()) {
+            self.select(next);
+        }
         self.rescan();
     }
 }

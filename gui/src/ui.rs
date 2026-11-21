@@ -46,6 +46,7 @@ const I_WARNING: char = '\u{E7BA}';
 const I_ERROR: char = '\u{E783}';
 const I_OPEN: char = '\u{E8A7}';
 const I_ADD: char = '\u{E710}';
+const I_NEXT: char = '\u{E72A}';
 const I_MIN: char = '\u{E921}';
 const I_MAX: char = '\u{E922}';
 const I_RESTORE: char = '\u{E923}';
@@ -334,7 +335,7 @@ fn body() -> Div {
 
 impl Wizard {
     fn step_index(&self) -> usize {
-        if self.finished.is_some() {
+        if self.viewing_done.is_some() {
             STEPS.len()
         } else {
             self.current_step()
@@ -343,7 +344,7 @@ impl Wizard {
 
     /// The status line under the game's tile, like the launcher's library.
     fn game_status(&self) -> (char, String, u32) {
-        if self.finished.is_some() {
+        if self.viewing_done.is_some() {
             return (I_PLAY, "Ready to launch".into(), ACCENT);
         }
         if let CopyState::Running { progress, .. } = &self.copy {
@@ -681,26 +682,51 @@ impl Wizard {
     }
 
     fn render_done(&self, name: &str, cx: &mut Context<Self>) -> Screen {
+        // With more downloads waiting, carrying on is the main action; Epic
+        // only needs opening once they're all done.
+        let next = self.next_pending().map(|i| i.display_name.clone());
+        let (open_style, next_style) = if next.is_some() {
+            (Style::Secondary, Style::Primary)
+        } else {
+            (Style::Primary, Style::Secondary)
+        };
+        let next_button = button(
+            "next-game",
+            Some(if next.is_some() { I_NEXT } else { I_ADD }),
+            match &next {
+                Some(name) => format!("Next: {name}"),
+                None => "Add another game".to_string(),
+            },
+            next_style,
+        )
+        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+            this.next_game();
+            cx.notify();
+        }));
+        let open_button = button("open-epic-done", Some(I_OPEN), "Open Epic Games Launcher", open_style).on_click(
+            cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.launcher_error = epic::open_launcher().err();
+                cx.notify();
+            }),
+        );
+        let remaining = self.installs.len();
         Screen::new(
             format!("{name} is ready"),
-            "Open the Epic Games Launcher and the game should show Launch. If Epic says it needs to verify the files, let it finish: that only checks them and doesn't download the game again.",
-            body().children(self.launcher_error.clone().map(|e| callout(ERR, e))).child(
-                row()
-                    .child(
-                        button("open-epic-done", Some(I_OPEN), "Open Epic Games Launcher", Style::Primary).on_click(
-                            cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.launcher_error = epic::open_launcher().err();
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(button("again", Some(I_ADD), "Add another game", Style::Secondary).on_click(cx.listener(
-                        |this, _: &ClickEvent, _, cx| {
-                            this.start_over();
-                            cx.notify();
-                        },
-                    ))),
-            ),
+            if remaining > 0 {
+                format!(
+                    "{name} is installed. {} more download{} waiting; finish {} first, then open the Epic Games Launcher.",
+                    remaining,
+                    if remaining == 1 { " is" } else { "s are" },
+                    if remaining == 1 { "it" } else { "them" }
+                )
+            } else {
+                "Open the Epic Games Launcher and the game should show Launch. If Epic says it needs to verify the files, let it finish: that only checks them and doesn't download the game again.".to_string()
+            },
+            body().children(self.launcher_error.clone().map(|e| callout(ERR, e))).child(if next.is_some() {
+                row().child(next_button).child(open_button)
+            } else {
+                row().child(open_button).child(next_button)
+            }),
         )
     }
 
@@ -748,7 +774,78 @@ impl Wizard {
         div().flex().flex_none().items_center().h(px(HEADER_H)).mt(px(HEADER_GAP))
     }
 
-    fn render_sidebar(&self, layout: Layout) -> Div {
+    /// Status for a game in the sidebar list, including ones not selected.
+    fn list_status(&self, install: &PendingInstall) -> (char, String, u32) {
+        if self.selected.as_ref() == Some(&install.item_path) {
+            return self.game_status();
+        }
+        if self.plans.get(&install.item_path).is_none_or(|p| p.waiting_for_download) {
+            return (I_DOWNLOAD, "Waiting for Epic".into(), MUTED);
+        }
+        match self.progress_of(&install.item_path) {
+            Some(p) if matches!(p.copy, CopyState::Done(_)) => (I_CHECK, "Files in place".into(), OK),
+            Some(p) if p.source.is_some() => (I_COPY, "Files chosen".into(), TEXT_2),
+            _ => (I_DOWNLOAD, "Needs game files".into(), TEXT_2),
+        }
+    }
+
+    /// One game in the sidebar list: cover, name and status.
+    fn game_row(
+        &self,
+        id: (&'static str, usize),
+        install: &PendingInstall,
+        (glyph, status, status_color): (char, String, u32),
+        active: bool,
+        enabled: bool,
+        compact: bool,
+    ) -> Stateful<Div> {
+        let tile = cover(&install.display_name, self.cover_path(install), 32., 43.);
+        div()
+            .id(id)
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap_3()
+            .py_2()
+            .rounded(px(8.))
+            .when(compact, |el| el.justify_center())
+            .when(!compact, |el| el.px_4())
+            .when(active, |el| el.bg(rgb(SURFACE_2)))
+            .when(enabled && !active, |el| el.cursor_pointer().hover(|s| s.bg(rgb(SURFACE_2))))
+            .when(!enabled, |el| el.opacity(0.45))
+            .child(tile)
+            .when(!compact, |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .gap(px(2.))
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(if active { TEXT } else { TEXT_2 }))
+                                .child(install.display_name.clone()),
+                        )
+                        .when(!status.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_xs()
+                                    .text_color(rgb(status_color))
+                                    .child(icon(glyph).text_size(px(10.)))
+                                    .child(status),
+                            )
+                        }),
+                )
+            })
+    }
+
+    fn render_sidebar(&self, layout: Layout, cx: &mut Context<Self>) -> Div {
         let current = self.step_index();
         let compact = layout.compact;
         let mut nav = div().flex().flex_col().gap_1();
@@ -800,50 +897,85 @@ impl Wizard {
             );
         }
 
-        let game = self.install().map(|install| {
-            let (glyph, status, status_color) = self.game_status();
-            let tile = cover(&install.display_name, self.cover_path(install), 40., 53.);
-            if compact {
-                return div().flex().justify_center().child(tile);
-            }
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(div().px_4().child(section_label("YOUR GAME")))
-                .child(
+        // Every unfinished download, then the games finished this session,
+        // like the launcher's download overview. Click one to switch to it.
+        let copying = self.copy_running();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (i, install) in self.installs.iter().enumerate() {
+            let active = self.viewing_done.is_none() && self.selected.as_ref() == Some(&install.item_path);
+            let enabled = !copying || active;
+            let path = install.item_path.clone();
+            rows.push(
+                self.game_row(("game", i), install, self.list_status(install), active, enabled, compact)
+                    .when(enabled && !active, |row| {
+                        row.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.select(path.clone());
+                            cx.notify();
+                        }))
+                    })
+                    .into_any_element(),
+            );
+        }
+        for (j, install) in self.done.iter().enumerate() {
+            let active = self.viewing_done == Some(j);
+            let enabled = !copying || active;
+            rows.push(
+                self.game_row(
+                    ("done", j),
+                    install,
+                    (I_PLAY, "Ready to launch".into(), ACCENT),
+                    active,
+                    enabled,
+                    compact,
+                )
+                .when(enabled && !active, |row| {
+                    row.on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.view_done(j);
+                        cx.notify();
+                    }))
+                })
+                .into_any_element(),
+            );
+        }
+        let count = rows.len();
+        let games = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .flex_1()
+            .min_h_0()
+            .when(count > 0 && !compact, |el| {
+                el.child(
                     div()
                         .flex()
                         .items_center()
-                        .gap_3()
+                        .gap_2()
                         .px_4()
-                        .child(tile)
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_1()
-                                .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(install.display_name.clone()))
-                                .when(!status.is_empty(), |el| {
-                                    el.child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .text_xs()
-                                            .text_color(rgb(status_color))
-                                            .child(icon(glyph).text_size(px(10.)))
-                                            .child(status),
-                                    )
-                                }),
-                        ),
+                        .child(section_label(if count == 1 { "YOUR GAME" } else { "YOUR GAMES" }))
+                        .when(count > 1, |el| {
+                            el.child(
+                                div()
+                                    .px(px(7.))
+                                    .rounded_full()
+                                    .bg(rgb(HOVER))
+                                    .text_xs()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(rgb(TEXT))
+                                    .child(count.to_string()),
+                            )
+                        }),
                 )
-        });
+            })
+            .child(div().id("games").flex().flex_col().gap_1().flex_1().min_h_0().overflow_y_scroll().children(rows));
 
-        let footer = if self.finished.is_some() {
-            if compact { "\u{2713}".to_string() } else { "All done".to_string() }
+        let footer = if self.viewing_done.is_some() {
+            match (self.installs.len(), compact) {
+                (0, true) => "\u{2713}".to_string(),
+                (0, false) => "All done".to_string(),
+                (left, true) => format!("{left} left"),
+                (1, false) => "1 game left".to_string(),
+                (left, false) => format!("{left} games left"),
+            }
         } else if compact {
             format!("{}/{}", current + 1, STEPS.len())
         } else {
@@ -878,8 +1010,7 @@ impl Wizard {
             .child(div().h(px(36.)))
             .child(nav)
             .child(div().h(px(32.)))
-            .children(game)
-            .child(div().flex_1())
+            .child(games)
             .child(
                 div()
                     .w_full()
@@ -1052,7 +1183,7 @@ impl Render for Wizard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let viewport = window.viewport_size();
         let layout = Layout::new(f32::from(viewport.width), f32::from(viewport.height));
-        let screen = match self.finished.clone() {
+        let screen = match self.done_view().map(|i| i.display_name.clone()) {
             Some(name) => self.render_done(&name, cx),
             None => match self.current_step() {
                 0 => self.render_download_step(cx),
@@ -1062,13 +1193,13 @@ impl Render for Wizard {
                 _ => self.render_finish_step(cx),
             },
         };
-        let (pill_icon, pill_text) = if self.finished.is_some() {
+        let (pill_icon, pill_text) = if self.viewing_done.is_some() {
             (I_CHECK, "Done".to_string())
         } else {
             let step = self.current_step();
             (STEP_ICONS[step.min(4)], format!("Step {} of {}  \u{00b7}  {}", step + 1, STEPS.len(), STEPS[step.min(4)]))
         };
-        let game_panel = self.install().cloned().map(|install| self.render_game_panel(&install, layout));
+        let game_panel = self.shown_install().cloned().map(|install| self.render_game_panel(&install, layout));
         let (panel_above, panel_side) = if layout.stacked { (game_panel, None) } else { (None, game_panel) };
 
         // Content starts right next to the sidebar and fills the space up to
@@ -1126,7 +1257,7 @@ impl Render for Wizard {
             .flex()
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
-            .child(self.render_sidebar(layout))
+            .child(self.render_sidebar(layout, cx))
             .child(main)
             .children(panel_side)
             .child(self.render_titlebar(window))

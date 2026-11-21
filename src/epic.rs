@@ -66,7 +66,8 @@ pub fn scan_pending(manifests_dir: &Path) -> Result<Vec<PendingInstall>, String>
     let mut installs = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() {
+        // Only real manifests; not leftovers like `*.item.epiccopy-old`.
+        if !path.is_file() || !path.extension().is_some_and(|e| e.eq_ignore_ascii_case("item")) {
             continue;
         }
         let Ok(text) = fs::read_to_string(&path) else { continue };
@@ -160,11 +161,78 @@ fn write_tab_indented(value: &Value) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Suffix for files and folders set aside while `apply` runs, so every step
+/// can be undone until the end.
+const ASIDE: &str = "epiccopy-old";
+
+fn aside(path: &Path) -> PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".");
+    name.push(ASIDE);
+    path.with_file_name(name)
+}
+
+/// Undo log for `apply`: each entry reverses one change on disk.
+enum Undo {
+    /// Rename `to` back to `from`.
+    Rename { from: PathBuf, to: PathBuf },
+    /// Remove a file that was created.
+    Remove(PathBuf),
+}
+
+/// Reverses recorded changes, newest first. Returns what couldn't be undone.
+fn roll_back(journal: Vec<Undo>) -> Vec<String> {
+    let mut failures = Vec::new();
+    for step in journal.into_iter().rev() {
+        let result = match &step {
+            Undo::Rename { from, to } => fs::rename(to, from),
+            Undo::Remove(path) => fs::remove_file(path),
+        };
+        if let Err(e) = result {
+            let what = match &step {
+                Undo::Rename { from, .. } => from,
+                Undo::Remove(path) => path,
+            };
+            failures.push(format!("{}: {e}", what.display()));
+        }
+    }
+    failures
+}
+
+/// Renames `from` to `to`, first setting aside anything already at `to` so it
+/// can be restored. Each change is recorded in `journal`.
+fn move_recorded(from: &Path, to: &Path, journal: &mut Vec<Undo>) -> io::Result<()> {
+    if to.exists() {
+        let parked = aside(to);
+        if parked.exists() {
+            remove_any(&parked)?;
+        }
+        fs::rename(to, &parked)?;
+        journal.push(Undo::Rename { from: to.to_path_buf(), to: parked });
+    }
+    fs::rename(from, to)?;
+    journal.push(Undo::Rename { from: from.to_path_buf(), to: to.to_path_buf() });
+    Ok(())
+}
+
+fn remove_any(path: &Path) -> io::Result<()> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+}
+
 /// Marks the install complete in Epic's manifests, reporting each step
 /// through `log`:
-/// 1. clear `bIsIncompleteInstall` and move the `.item` out of `Pending`,
-/// 2. delete `.egstore\bps`,
-/// 3. move `.egstore\Pending\<InstallationGuid>.*` into `.egstore`.
+/// 1. set `.egstore\bps` (the partial-download state) aside,
+/// 2. move `.egstore\Pending\<InstallationGuid>.*` into `.egstore`,
+/// 3. write the `.item` with `bIsIncompleteInstall: false` into `Manifests`
+///    and remove it from `Pending`.
+///
+/// Nothing is deleted until every step has succeeded: files that would be
+/// replaced are renamed aside, and if any step fails all changes are undone
+/// in reverse order. Only then are the set-aside copies deleted.
 pub fn apply(plan: &Plan, log: &mut dyn FnMut(String)) -> Result<(), String> {
     if !plan.is_ready() {
         return Err(plan.problems.join("\n"));
@@ -175,38 +243,65 @@ pub fn apply(plan: &Plan, log: &mut dyn FnMut(String)) -> Result<(), String> {
     let manifests_dir = pending_dir.parent().ok_or("Pending folder has no parent")?;
     let dest_item = manifests_dir.join(src_item.file_name().ok_or("Manifest has no file name")?);
 
-    // 1. Flag the install as complete and move the manifest out of Pending.
-    log(format!("Marking {} as installed", install.display_name));
+    // Everything that can fail without touching the disk happens first.
     let original = fs::read(src_item).map_err(|e| format!("Cannot read manifest: {e}"))?;
     let mut json: Value =
         serde_json::from_slice(&original).map_err(|e| format!("Manifest is not valid JSON: {e}"))?;
     json["bIsIncompleteInstall"] = Value::Bool(false);
     let updated = write_tab_indented(&json)?;
-    fs::write(&dest_item, &updated).map_err(|e| format!("Cannot write {}: {e}", dest_item.display()))?;
-    if let Err(e) = fs::remove_file(src_item) {
-        let _ = fs::remove_file(&dest_item);
-        return Err(format!("Cannot move manifest out of Pending: {e}"));
-    }
 
-    // 2. Delete the partial-download state. Roll the manifest back on failure.
-    log(format!("Deleting {}", plan.bps_dir.display()));
-    if let Err(e) = fs::remove_dir_all(&plan.bps_dir) {
-        let _ = fs::write(src_item, &original);
-        let _ = fs::remove_file(&dest_item);
-        log("Rolled back manifest changes.".into());
-        return Err(format!("Cannot delete {}: {e}", plan.bps_dir.display()));
-    }
+    let mut journal = Vec::new();
+    let result = (|| -> Result<(), String> {
+        // 1. Set the partial-download state aside (one atomic rename).
+        log(format!("Setting aside {}", plan.bps_dir.display()));
+        let bps_aside = aside(&plan.bps_dir);
+        move_recorded(&plan.bps_dir, &bps_aside, &mut journal)
+            .map_err(|e| format!("Cannot move {} (is a file in it open?): {e}", plan.bps_dir.display()))?;
 
-    // 3. Promote the pending install files into .egstore.
-    for file in &plan.pending_files {
-        let dest = install.manifest_location.join(file.file_name().unwrap_or_default());
-        log(format!("Moving {}", file.display()));
-        if dest.exists() {
-            let _ = fs::remove_file(&dest);
+        // 2. Promote the downloaded install manifest files into .egstore.
+        for file in &plan.pending_files {
+            let dest = install.manifest_location.join(file.file_name().unwrap_or_default());
+            log(format!("Moving {}", file.display()));
+            move_recorded(file, &dest, &mut journal).map_err(|e| format!("Cannot move {}: {e}", file.display()))?;
         }
-        fs::rename(file, &dest).map_err(|e| format!("Cannot move {}: {e}", file.display()))?;
+
+        // 3. Write the completed manifest next to Pending (via a temp file so a
+        //    half-written manifest never appears), then drop the pending one.
+        log(format!("Marking {} as installed", install.display_name));
+        let tmp = dest_item.with_extension("item.epiccopy-tmp");
+        fs::write(&tmp, &updated).map_err(|e| format!("Cannot write {}: {e}", tmp.display()))?;
+        journal.push(Undo::Remove(tmp.clone()));
+        move_recorded(&tmp, &dest_item, &mut journal)
+            .map_err(|e| format!("Cannot write {}: {e}", dest_item.display()))?;
+        // Undoing the move above restores the temp file, then the entry
+        // before it removes it again.
+        move_recorded(src_item, &aside(src_item), &mut journal)
+            .map_err(|e| format!("Cannot move manifest out of Pending: {e}"))?;
+        Ok(())
+    })();
+
+    if let Err(error) = result {
+        let failures = roll_back(journal);
+        if failures.is_empty() {
+            log("Rolled back all changes.".into());
+            return Err(format!("{error}\nNothing was changed; you can try again."));
+        }
+        return Err(format!(
+            "{error}\nSome changes couldn't be undone:\n{}",
+            failures.join("\n")
+        ));
     }
 
+    // Commit: delete what was set aside. Leftovers here are harmless.
+    for step in &journal {
+        if let Undo::Rename { to, .. } = step {
+            if to.extension().is_some_and(|e| e == ASIDE) {
+                if let Err(e) = remove_any(to) {
+                    log(format!("Couldn't clean up {}: {e}", to.display()));
+                }
+            }
+        }
+    }
     log("Done.".into());
     Ok(())
 }
@@ -222,8 +317,14 @@ fn is_egstore(name: &std::ffi::OsStr) -> bool {
 /// Every file under `root` (paths relative to `root`) with its size. The
 /// launcher's own `.egstore` folder at the top level is skipped: it belongs to
 /// the machine the files came from.
+///
+/// Symlinks and junctions are followed (their targets are copied as real
+/// files and folders); a folder reached twice is only listed once, so a
+/// junction loop can't recurse forever.
 pub fn list_files(root: &Path) -> io::Result<Vec<(PathBuf, u64)>> {
     let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(fs::canonicalize(root)?);
     let mut stack = vec![PathBuf::new()];
     while let Some(rel) = stack.pop() {
         for entry in fs::read_dir(root.join(&rel))? {
@@ -232,11 +333,25 @@ pub fn list_files(root: &Path) -> io::Result<Vec<(PathBuf, u64)>> {
             if rel.as_os_str().is_empty() && is_egstore(&name) {
                 continue;
             }
-            let file_type = entry.file_type()?;
+            let mut file_type = entry.file_type()?;
+            let mut len = None;
+            if file_type.is_symlink() {
+                // Follow the link; a dangling one is skipped.
+                let Ok(meta) = fs::metadata(entry.path()) else { continue };
+                file_type = meta.file_type();
+                len = Some(meta.len());
+                if meta.is_dir() && !seen.insert(fs::canonicalize(entry.path())?) {
+                    continue;
+                }
+            }
             if file_type.is_dir() {
                 stack.push(rel.join(&name));
             } else if file_type.is_file() {
-                out.push((rel.join(&name), entry.metadata()?.len()));
+                let len = match len {
+                    Some(len) => len,
+                    None => entry.metadata()?.len(),
+                };
+                out.push((rel.join(&name), len));
             }
         }
     }
@@ -247,11 +362,25 @@ pub fn list_files(root: &Path) -> io::Result<Vec<(PathBuf, u64)>> {
 pub struct DirStats {
     pub bytes: u64,
     pub files: u64,
+    /// Bytes already in the target folder that the copy would overwrite.
+    pub replaced: u64,
 }
 
-pub fn dir_stats(root: &Path) -> io::Result<DirStats> {
+impl DirStats {
+    /// Extra disk space copying needs: overwritten files free their space.
+    pub fn bytes_needed(&self) -> u64 {
+        self.bytes.saturating_sub(self.replaced)
+    }
+}
+
+/// Size of `root`; with `target`, also how much of `target` a copy of `root`
+/// into it would overwrite (files at the same relative path).
+pub fn dir_stats(root: &Path, target: Option<&Path>) -> io::Result<DirStats> {
     let files = list_files(root)?;
-    Ok(DirStats { bytes: files.iter().map(|f| f.1).sum(), files: files.len() as u64 })
+    let replaced = target.map_or(0, |target| {
+        files.iter().filter_map(|(rel, _)| fs::metadata(target.join(rel)).ok()).map(|m| m.len()).sum()
+    });
+    Ok(DirStats { bytes: files.iter().map(|f| f.1).sum(), files: files.len() as u64, replaced })
 }
 
 /// People often pick the drive or folder that *contains* the game folder. If
@@ -613,8 +742,8 @@ mod tests {
     fn copies_game_and_skips_egstore() {
         let f = fixture("copy", true);
         let src = source_game(&f);
-        let stats = dir_stats(&src).unwrap();
-        assert_eq!((stats.files, stats.bytes), (2, 11));
+        let stats = dir_stats(&src, Some(&f.game)).unwrap();
+        assert_eq!((stats.files, stats.bytes, stats.replaced), (2, 11, 0));
 
         let progress = CopyProgress::default();
         copy_game(&src, &f.game, &progress).unwrap();
@@ -697,6 +826,108 @@ mod tests {
         assert_eq!(cover_url(b"not base64!", "abc123"), None);
         assert_eq!(image_extension(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
         assert_eq!(image_extension(b"<html>"), None);
+    }
+
+    /// Every file under `dir` whose name contains `needle` (leftovers check).
+    fn find_named(dir: &Path, needle: &str) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.to_string_lossy().contains(needle) {
+                found.push(path.clone());
+            }
+            if path.is_dir() {
+                found.extend(find_named(&path, needle));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn apply_rolls_everything_back_when_a_step_fails() {
+        let f = fixture("rollback", true);
+        // Pre-existing files that apply would replace must come back intact.
+        fs::write(f.manifests.join("ABC.item"), "old manifest").unwrap();
+        fs::write(f.egstore.join("GUID123.mancpn"), "old mancpn").unwrap();
+        let p = plan(&scan_pending(&f.manifests).unwrap()[0]);
+        assert!(p.is_ready());
+        // Make the last pending-file move fail after the first one succeeded.
+        fs::remove_file(p.pending_files.last().unwrap()).unwrap();
+
+        let err = apply(&p, &mut |_| {}).unwrap_err();
+        assert!(err.contains("Nothing was changed"), "{err}");
+
+        assert!(f.egstore.join("bps").join("chunk.bp").is_file(), "bps restored");
+        assert!(f.manifests.join("Pending").join("ABC.item").is_file(), "pending manifest kept");
+        assert_eq!(fs::read_to_string(f.manifests.join("ABC.item")).unwrap(), "old manifest");
+        assert_eq!(fs::read_to_string(f.egstore.join("GUID123.mancpn")).unwrap(), "old mancpn");
+        let first = p.pending_files.first().unwrap();
+        assert!(first.is_file(), "moved file returned to Pending");
+        assert!(find_named(&f.root, ASIDE).is_empty(), "no set-aside leftovers");
+        assert!(find_named(&f.root, "epiccopy-tmp").is_empty(), "no temp leftovers");
+    }
+
+    #[test]
+    fn apply_replaces_existing_files_and_cleans_up() {
+        let f = fixture("replace", true);
+        fs::write(f.manifests.join("ABC.item"), "old manifest").unwrap();
+        fs::write(f.egstore.join("GUID123.manifest"), "old").unwrap();
+        let p = plan(&scan_pending(&f.manifests).unwrap()[0]);
+        apply(&p, &mut |_| {}).unwrap();
+
+        let moved: Value =
+            serde_json::from_str(&fs::read_to_string(f.manifests.join("ABC.item")).unwrap()).unwrap();
+        assert_eq!(moved["bIsIncompleteInstall"], Value::Bool(false));
+        assert_eq!(fs::read_to_string(f.egstore.join("GUID123.manifest")).unwrap(), "m");
+        assert!(find_named(&f.root, ASIDE).is_empty(), "set-aside copies deleted");
+        assert!(scan_pending(&f.manifests).unwrap().is_empty());
+    }
+
+    #[test]
+    fn scan_ignores_leftover_files_in_pending() {
+        let f = fixture("leftovers", true);
+        fs::copy(f.manifests.join("Pending").join("ABC.item"), f.manifests.join("Pending").join("ABC.item.epiccopy-old"))
+            .unwrap();
+        assert_eq!(scan_pending(&f.manifests).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stats_count_bytes_a_copy_would_overwrite() {
+        let f = fixture("replaced", true);
+        let src = source_game(&f);
+        fs::write(f.game.join("data.pak"), "1234").unwrap();
+        let stats = dir_stats(&src, Some(&f.game)).unwrap();
+        assert_eq!((stats.bytes, stats.replaced, stats.bytes_needed()), (11, 4, 7));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_follows_junctions_without_looping() {
+        let f = fixture("junction", true);
+        let src = source_game(&f);
+        let real = f.root.join("ExtraContent");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("extra.pak"), "xyz").unwrap();
+        let link = |at: &Path, to: &Path| {
+            let ok = Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(at)
+                .arg(to)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "mklink /J failed");
+        };
+        link(&src.join("Content"), &real);
+        // A junction pointing back up must not make listing recurse forever.
+        link(&real.join("loop"), &src);
+
+        let files = list_files(&src).unwrap();
+        assert!(files.iter().any(|(rel, _)| rel == Path::new("Content").join("extra.pak").as_path()));
+        let progress = CopyProgress::default();
+        copy_game(&src, &f.game, &progress).unwrap();
+        assert_eq!(fs::read_to_string(f.game.join("Content").join("extra.pak")).unwrap(), "xyz");
     }
 
     #[test]

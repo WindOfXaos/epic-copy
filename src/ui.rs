@@ -1201,6 +1201,17 @@ impl Render for Wizard {
         };
         let game_panel = self.shown_install().cloned().map(|install| self.render_game_panel(&install, layout));
         let (panel_above, panel_side) = if layout.stacked { (game_panel, None) } else { (None, game_panel) };
+        // Messages about a game that's gone (e.g. a failed Finish) stay until dismissed.
+        let notice = self.notice.clone().map(|text| {
+            div().flex().flex_col().gap_2().child(callout(ERR, text)).child(row().child(
+                button("dismiss-notice", None, "Dismiss", Style::Secondary).on_click(cx.listener(
+                    |this, _: &ClickEvent, _, cx| {
+                        this.notice = None;
+                        cx.notify();
+                    },
+                )),
+            ))
+        });
 
         // Content starts right next to the sidebar and fills the space up to
         // the game column; only paragraphs keep a readable line length.
@@ -1244,6 +1255,7 @@ impl Render for Wizard {
                             .flex()
                             .flex_col()
                             .gap_6()
+                            .children(notice)
                             .children(panel_above)
                             .children(screen.subtitle.map(|s| para(s).max_w(px(READABLE))))
                             .child(screen.body),

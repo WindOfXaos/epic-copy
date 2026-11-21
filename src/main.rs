@@ -11,8 +11,8 @@ mod ui;
 
 use epic::{format_bytes, CopyProgress, DirStats, PendingInstall, Plan};
 use gpui::{
-    point, prelude::*, px, size, App, Application, Bounds, Context, PathPromptOptions,
-    TitlebarOptions, WindowBounds, WindowOptions,
+    point, prelude::*, px, size, App, Application, Bounds, Context, Entity, PathPromptOptions,
+    PromptLevel, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -58,17 +58,24 @@ enum Measure {
 }
 
 impl Measure {
-    fn start(path: &Path) -> Self {
+    /// Measures `path`; with `target`, also how much of it a copy would overwrite.
+    fn start(path: &Path, target: Option<&Path>) -> Self {
         let path = path.to_path_buf();
-        Measure::Running(in_background(move || epic::dir_stats(&path).map_err(|e| e.to_string())))
+        let target = target.map(Path::to_path_buf);
+        Measure::Running(in_background(move || {
+            epic::dir_stats(&path, target.as_deref()).map_err(|e| e.to_string())
+        }))
     }
 
-    fn poll(&mut self) {
+    /// Returns true when the measurement just finished.
+    fn poll(&mut self) -> bool {
         if let Measure::Running(slot) = self {
             if let Some(result) = take(slot) {
                 *self = Measure::Done(result);
+                return true;
             }
         }
+        false
     }
 
     fn stats(&self) -> Option<DirStats> {
@@ -87,6 +94,10 @@ struct Source {
     in_place: bool,
     measure: Measure,
     has_executable: Option<bool>,
+    /// Result of `Wizard::compute_check`, refreshed when something it depends
+    /// on changes. Cached because it touches the disk (canonical paths, free
+    /// space) and the UI asks for it several times per frame.
+    check: SourceCheck,
 }
 
 enum CopyState {
@@ -98,7 +109,7 @@ enum CopyState {
 
 /// Problems with the chosen game folder. Errors block; warnings need an
 /// explicit "use them anyway".
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct SourceCheck {
     measuring: bool,
     errors: Vec<String>,
@@ -148,6 +159,8 @@ struct Wizard {
     warnings_accepted: bool,
     copy: CopyState,
     finish_error: Option<String>,
+    /// A message that outlives the game it's about (shown until dismissed).
+    notice: Option<String>,
     /// Cover art per catalog item ID.
     covers: HashMap<String, Cover>,
     ticks: u64,
@@ -173,6 +186,7 @@ impl Wizard {
             warnings_accepted: false,
             copy: CopyState::Idle,
             finish_error: None,
+            notice: None,
             covers: HashMap::new(),
             ticks: 0,
         };
@@ -220,8 +234,9 @@ impl Wizard {
                 }
             }
         }
-        if let Some(source) = &mut self.source {
-            source.measure.poll();
+        let measured = self.source.as_mut().is_some_and(|s| s.measure.poll());
+        if measured {
+            self.refresh_check();
         }
         if let CopyState::Running { result, .. } = &self.copy {
             if let Some(result) = take(result) {
@@ -235,7 +250,9 @@ impl Wizard {
             if let Some(result) = take(slot) {
                 self.closing_launcher = None;
                 self.launcher_error = result.err();
-                self.launcher_running = epic::launcher_running();
+                // Re-check off the UI thread; a check started before the
+                // kill could report a stale "running".
+                self.launcher_check = Some(in_background(epic::launcher_running));
             }
         }
         if let Some(slot) = &self.launcher_check {
@@ -263,11 +280,9 @@ impl Wizard {
                 self.scan_error = None;
                 self.load_covers();
             }
-            Err(e) => {
-                self.installs.clear();
-                self.plans.clear();
-                self.scan_error = Some(e);
-            }
+            // Keep what we knew: a failed scan (say, a file mid-write) must
+            // not make every game, and a running copy, disappear.
+            Err(e) => self.scan_error = Some(e),
         }
         // Forget progress for downloads that were removed in the launcher.
         let plans = &self.plans;
@@ -276,7 +291,19 @@ impl Wizard {
         match self.selected.clone() {
             Some(selected) => match self.plans.get(&selected) {
                 Some(plan) => self.plan = Some(plan.clone()),
-                None => self.clear_selected(),
+                None => {
+                    // The download vanished (removed in Epic, or a Finish that
+                    // failed partway). Say so instead of silently moving on.
+                    let name = self.install().map(|i| i.display_name.clone()).unwrap_or_default();
+                    if let Some(error) = self.finish_error.clone() {
+                        self.notice = Some(format!("Finishing {name} failed: {error}"));
+                    } else if self.copy_running() {
+                        self.notice = Some(format!(
+                            "{name} is no longer in Epic's downloads, so copying was stopped. Files copied so far are still in its install folder."
+                        ));
+                    }
+                    self.clear_selected();
+                }
             },
             // With a single download there's nothing to choose.
             None if self.viewing_done.is_none() && self.installs.len() == 1 => {
@@ -292,6 +319,8 @@ impl Wizard {
     }
 
     fn clear_selected(&mut self) {
+        // Never leave a copy running with nothing on screen to show or stop it.
+        self.cancel_copy();
         self.selected = None;
         self.plan = None;
         self.source = None;
@@ -337,6 +366,8 @@ impl Wizard {
         }
         self.plan = Some(plan);
         self.selected = Some(item_path);
+        // Free space may have changed while this game was parked.
+        self.refresh_check();
     }
 
     /// Shows the done screen of a game finished earlier in this session.
@@ -377,19 +408,34 @@ impl Wizard {
         let adjusted_from = (path != chosen).then_some(chosen);
         let in_place = epic::same_folder(&path, &install.install_location);
         let has_executable = install.launch_executable.as_ref().map(|exe| path.join(exe).is_file());
+        let target = (!in_place).then_some(install.install_location.as_path());
         self.source = Some(Source {
-            measure: Measure::start(&path),
+            measure: Measure::start(&path, target),
             path,
             adjusted_from,
             in_place,
             has_executable,
+            check: SourceCheck::default(),
         });
         self.warnings_accepted = false;
         self.copy = CopyState::Idle;
         self.finish_error = None;
+        self.refresh_check();
     }
 
+    /// The cached check for the chosen folder (see `Source::check`).
     fn check_source(&self) -> SourceCheck {
+        self.source.as_ref().map(|s| s.check.clone()).unwrap_or_default()
+    }
+
+    fn refresh_check(&mut self) {
+        let check = self.compute_check();
+        if let Some(source) = &mut self.source {
+            source.check = check;
+        }
+    }
+
+    fn compute_check(&self) -> SourceCheck {
         let mut check = SourceCheck::default();
         let (Some(source), Some(install)) = (&self.source, self.install()) else { return check };
         let target = &install.install_location;
@@ -415,8 +461,13 @@ impl Wizard {
                     });
                 } else {
                     let pct = install.expected_size.map(|e| stats.bytes as f64 / e as f64);
-                    // Only Epic's own partial download is there: nothing to finish with.
-                    let barely_started = pct.is_some_and(|p| p < 0.5) || source.has_executable == Some(false);
+                    // Only Epic's own partial download is there: nothing to finish
+                    // with. A missing exe alone only decides this when the size is
+                    // unknown; otherwise it's a warning below, like for a copy.
+                    let barely_started = match pct {
+                        Some(p) => p < 0.5,
+                        None => source.has_executable == Some(false),
+                    };
                     if source.in_place && barely_started {
                         check.errors.push(format!(
                             "The install folder only has {} so far, just what Epic started downloading. Choose the folder where your copy of {} is.",
@@ -448,11 +499,13 @@ impl Wizard {
                         }
                     }
                     if !source.in_place {
+                        // Files already in the install folder get overwritten, so
+                        // only the difference needs free space.
                         if let Some(free) = epic::free_space(target) {
-                            if free < stats.bytes {
+                            if free < stats.bytes_needed() {
                                 check.errors.push(format!(
-                                    "Not enough space on the install drive: {} needed, {} free.",
-                                    format_bytes(stats.bytes),
+                                    "Not enough space on the install drive: {} more needed, {} free.",
+                                    format_bytes(stats.bytes_needed()),
                                     format_bytes(free)
                                 ));
                             }
@@ -547,7 +600,8 @@ impl Wizard {
 
     fn finish(&mut self) {
         self.finish_error = None;
-        self.launcher_running = epic::launcher_running();
+        // Kept current by the background check every ~2s; the Finish step is
+        // only shown while it says Epic is closed.
         if self.launcher_running {
             return;
         }
@@ -585,6 +639,33 @@ impl Wizard {
 }
 
 
+/// Closing the window mid-copy would leave a half-copied game behind without
+/// a word; ask first.
+fn confirm_close_while_copying(window: &mut Window, cx: &mut App, wizard: Entity<Wizard>) {
+    window.on_window_should_close(cx, move |window, cx| {
+        if !wizard.read(cx).copy_running() {
+            return true;
+        }
+        let answer = window.prompt(
+            PromptLevel::Warning,
+            "A copy is still running",
+            Some("Quitting stops it. Files copied so far stay in the install folder; you can copy again later to complete them."),
+            &["Stop and quit", "Keep copying"],
+            cx,
+        );
+        let wizard = wizard.clone();
+        window
+            .spawn(cx, async move |cx| {
+                if answer.await == Ok(0) {
+                    wizard.update(cx, |wizard, _| wizard.cancel_copy()).ok();
+                    cx.update(|window, _| window.remove_window()).ok();
+                }
+            })
+            .detach();
+        false
+    });
+}
+
 fn main() {
     Application::new().run(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1080.), px(720.)), cx);
@@ -600,7 +681,11 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |_, cx| cx.new(Wizard::new),
+            |window, cx| {
+                let wizard = cx.new(Wizard::new);
+                confirm_close_while_copying(window, cx, wizard.clone());
+                wizard
+            },
         )
         .expect("failed to open window");
         cx.on_window_closed(|cx| {

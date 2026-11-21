@@ -14,6 +14,9 @@ gpui = "0.2"
 serde = "1"
 serde_json = { version = "1", features = ["preserve_order"] }
 
+[build-dependencies]
+winresource = "0.1"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
 

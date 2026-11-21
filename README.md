@@ -8,7 +8,9 @@ This script helps with transferring already downloaded games from other machines
 > This script is only tested on transferring games download **FROM** Epic launcher **TO** Epic launcher
 
 # GUI version
-`gui/` contains a desktop app built with [GPUI](https://www.gpui.rs/) that walks you through the whole transfer and does most of it for you. Instead of following the steps below by hand, run it and do what it says:
+<img src="gui/assets/logo-128.png" width="64" alt="Epic Copy logo">
+
+`gui/` contains a desktop app built with [GPUI](https://www.gpui.rs/), styled after the Epic Games Launcher, that walks you through the whole transfer and does most of it for you. Instead of following the steps below by hand, run it and do what it says:
 
 1. **Start the download in Epic.** It opens the launcher, tells you what to click, and notices the download by itself.
 2. **Close Epic.** It detects that the launcher is still running and can close it for you.

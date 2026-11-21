@@ -1,0 +1,18 @@
+[package]
+name = "epic-copy-gui"
+version = "0.1.0"
+edition = "2021"
+description = "GPUI front-end for script.ps1: finish an Epic Games Launcher install from copied game files"
+publish = false
+
+[[bin]]
+name = "epic-copy"
+path = "src/main.rs"
+
+[dependencies]
+gpui = "0.2"
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.release]
+strip = true

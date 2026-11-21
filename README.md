@@ -7,6 +7,23 @@ This script helps with transferring already downloaded games from other machines
 > **Note**
 > This script is only tested on transferring games download **FROM** Epic launcher **TO** Epic launcher
 
+# GUI version
+`gui/` contains a desktop app built with [GPUI](https://www.gpui.rs/) that does the same thing as `script.ps1`, without having to copy a script into the game folder:
+
+- Lists every pending (incomplete) install the Epic launcher knows about, or lets you pick the game folder to find the matching one.
+- Checks everything up front (launcher closed, `.egstore\bps` present, pending install files present) and shows what is missing.
+- Asks for a second click before changing anything, rolls the manifest back if deleting `bps` fails, and logs every step.
+
+Follow Steps 1–3 below, then run the app instead of Steps 4–5.
+
+Build it (needs Rust and the MSVC Build Tools with the Windows SDK):
+```powershell
+cd gui
+cargo build --release
+.\target\release\epic-copy.exe
+```
+Set `EPIC_MANIFESTS_DIR` to point the app at a different manifests folder (useful for testing with fake data).
+
 # Prerequisites
 - Game files that are downloaded from Epic launcher and are up-to-date from your machine or your friend's machine.
 - Only `script.ps1` from this repository

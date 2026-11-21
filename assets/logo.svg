@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- Epic Copy logo: a game copied from another PC (outline card) into place (filled card). -->
+  <defs>
+    <linearGradient id="card" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#5FDBFF"/>
+      <stop offset="1" stop-color="#1A8CFF"/>
+    </linearGradient>
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#25252B"/>
+      <stop offset="1" stop-color="#141417"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="url(#tile)"/>
+  <rect x="9" y="9" width="238" height="238" rx="55" fill="none" stroke="#FFFFFF" stroke-opacity="0.08" stroke-width="2"/>
+  <!-- The copy you brought -->
+  <rect x="50" y="46" width="108" height="140" rx="18" fill="none" stroke="#6B6B75" stroke-width="12"/>
+  <!-- Gap so the cards read as separate -->
+  <rect x="88" y="68" width="124" height="156" rx="26" fill="#18181C"/>
+  <!-- The installed game -->
+  <rect x="96" y="76" width="108" height="140" rx="18" fill="url(#card)"/>
+  <g fill="none" stroke="#0E0E12" stroke-width="14" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M150 104 V160"/>
+    <path d="M127 138 L150 161 L173 138"/>
+    <path d="M124 188 H176"/>
+  </g>
+</svg>

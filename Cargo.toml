@@ -1,0 +1,22 @@
+[package]
+name = "epic-copy"
+version = "0.1.0"
+edition = "2021"
+description = "Add games you already have to the Epic Games Launcher without downloading them again"
+publish = false
+
+[dependencies]
+gpui = "0.2"
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.22"
+ureq = "2"
+
+[build-dependencies]
+winresource = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+
+[profile.release]
+strip = true

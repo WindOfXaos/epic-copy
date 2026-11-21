@@ -5,9 +5,10 @@ use super::{CopyState, Wizard, STEPS};
 use crate::epic::{self, format_bytes, DirStats, PendingInstall};
 use gpui::{
     div, hsla, img, linear_color_stop, linear_gradient, prelude::*, px, relative, rgb, AnyElement,
-    ClickEvent, Context, Div, FontWeight, Hsla, Image, ImageFormat, Rgba, SharedString, Stateful,
-    Window, WindowControlArea,
+    ClickEvent, Context, Div, FontWeight, Hsla, Image, ImageFormat, ObjectFit, Rgba, SharedString,
+    Stateful, Window, WindowControlArea,
 };
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, OnceLock};
 
@@ -223,22 +224,82 @@ fn initials(name: &str) -> String {
     letters.to_uppercase()
 }
 
-/// Library-style cover for a game we have no artwork for.
-fn cover(name: &str, w: f32, h: f32, text: f32) -> Div {
+/// Library-style cover: Epic's artwork when we have it, otherwise a tile
+/// generated from the game's name.
+fn cover(name: &str, image: Option<PathBuf>, w: f32, h: f32) -> AnyElement {
+    let radius = px(if w > 80. { 8. } else { 4. });
+    if let Some(path) = image {
+        return img(path)
+            .w(px(w))
+            .h(px(h))
+            .flex_none()
+            .rounded(radius)
+            .object_fit(ObjectFit::Cover)
+            .into_any_element();
+    }
     let (a, b) = tile_colors(name);
     div()
         .w(px(w))
         .h(px(h))
         .flex_none()
-        .rounded(px(if w > 80. { 8. } else { 4. }))
+        .rounded(radius)
         .bg(linear_gradient(160., linear_color_stop(a, 0.), linear_color_stop(b, 1.)))
         .flex()
         .items_center()
         .justify_center()
-        .text_size(px(text))
+        .text_size(px((w * 0.3).clamp(14., 72.)))
         .font_weight(FontWeight::BLACK)
         .text_color(color(TEXT).opacity(0.92))
         .child(initials(name))
+        .into_any_element()
+}
+
+/// Long paths, shortened for narrow panels: `C:\…\Games\RocketLeague`.
+fn short_path(path: &Path) -> String {
+    let full = path.display().to_string();
+    if full.chars().count() <= 40 {
+        return full;
+    }
+    let parts: Vec<String> = path.components().map(|c| c.as_os_str().to_string_lossy().to_string()).collect();
+    if parts.len() <= 4 {
+        return full;
+    }
+    let root = parts[0].trim_end_matches('\\');
+    format!("{root}\\\u{2026}\\{}\\{}", parts[parts.len() - 2], parts[parts.len() - 1])
+}
+
+/// Sizes that follow the window width.
+#[derive(Clone, Copy)]
+struct Layout {
+    /// Icon-only sidebar on narrow windows.
+    compact: bool,
+    sidebar_w: f32,
+    pad: f32,
+    /// Game panel above the content instead of beside it.
+    stacked: bool,
+    panel_w: f32,
+    heading: f32,
+}
+
+/// Widest the content gets: a readable text column plus the game panel.
+const MAX_CONTENT: f32 = 1100.;
+
+impl Layout {
+    fn for_width(width: f32) -> Self {
+        let compact = width < 1000.;
+        let sidebar_w = if compact { 76. } else { 260. };
+        let pad = if width < 900. { 24. } else { 40. };
+        let content = (width - sidebar_w - 2. * pad).min(MAX_CONTENT);
+        let stacked = content < 760.;
+        Layout {
+            compact,
+            sidebar_w,
+            pad,
+            stacked,
+            panel_w: if stacked { 0. } else { (content * 0.3).clamp(250., 340.) },
+            heading: if content < 640. { 30. } else { 40. },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -324,7 +385,7 @@ impl Wizard {
                             this.select(path.clone());
                             cx.notify();
                         }))
-                        .child(cover(&install.display_name, 42., 56., 16.))
+                        .child(cover(&install.display_name, self.cover_path(install), 42., 56.))
                         .child(
                             div()
                                 .flex()
@@ -490,16 +551,15 @@ impl Wizard {
     fn render_copy_step(&self, cx: &mut Context<Self>) -> Screen {
         let (Some(source), Some(install)) = (&self.source, self.install()) else { return Screen::new("", "", body()) };
         let stats = source.measure.stats().unwrap_or_default();
-        let mut b = body().child(
-            panel()
-                .child(kv("From", source.path.display().to_string()))
-                .child(kv("To", install.install_location.display().to_string()))
-                .child(kv("Size", size_and_files(stats))),
-        );
+        let info = panel()
+            .child(kv("From", source.path.display().to_string()))
+            .child(kv("To", install.install_location.display().to_string()))
+            .child(kv("Size", size_and_files(stats)));
+        let mut b = body();
 
         match &self.copy {
             CopyState::Idle | CopyState::Done(_) => {
-                b = b.child(row().child(
+                b = b.child(info).child(row().child(
                     button("copy", Some(I_COPY), "Start copying", Style::Primary).on_click(cx.listener(
                         |this, _: &ClickEvent, _, cx| {
                             this.start_copy();
@@ -563,7 +623,8 @@ impl Wizard {
                                 cx.notify();
                             },
                         )))
-                    });
+                    })
+                    .child(info);
             }
             CopyState::Failed(error) => {
                 let cancelled = error == epic::CANCELLED;
@@ -580,6 +641,7 @@ impl Wizard {
                         },
                     )),
                 ));
+                b = b.child(info);
             }
         }
         Screen::new(
@@ -666,8 +728,15 @@ impl Wizard {
             .child(caption("close", I_CLOSE, WindowControlArea::Close, CLOSE_HOVER))
     }
 
-    fn render_sidebar(&self) -> Div {
+
+    /// Shared height for the logo row and the status pill so they line up.
+    fn header_row() -> Div {
+        div().flex().flex_none().items_center().h(px(44.)).mt(px(4.))
+    }
+
+    fn render_sidebar(&self, layout: Layout) -> Div {
         let current = self.step_index();
+        let compact = layout.compact;
         let mut nav = div().flex().flex_col().gap_1();
         for (i, title) in STEPS.iter().enumerate() {
             let done = i < current;
@@ -684,53 +753,57 @@ impl Wizard {
                     .flex()
                     .items_center()
                     .gap_4()
-                    .h(px(52.))
+                    .h(px(48.))
                     .px_4()
                     .rounded(px(8.))
+                    .when(compact, |el| el.justify_center())
                     .when(active, |el| el.bg(rgb(SURFACE_2)))
                     .child(
                         div()
                             .relative()
                             .flex_none()
-                            .w(px(22.))
+                            .w(px(20.))
+                            .flex()
+                            .justify_center()
                             .child(icon(glyph).text_size(px(18.)).text_color(rgb(glyph_color)))
                             .when(active, |el| {
                                 el.child(
-                                    div()
-                                        .absolute()
-                                        .top(px(-4.))
-                                        .left(px(-6.))
-                                        .size(px(6.))
-                                        .rounded_full()
-                                        .bg(rgb(ACCENT)),
+                                    div().absolute().top(px(-3.)).left(px(-6.)).size(px(6.)).rounded_full().bg(rgb(ACCENT)),
                                 )
                             }),
                     )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(15.))
-                            .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
-                            .text_color(rgb(text_color))
-                            .child(*title),
-                    ),
+                    .when(!compact, |el| {
+                        el.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_size(px(15.))
+                                .font_weight(if active { FontWeight::SEMIBOLD } else { FontWeight::NORMAL })
+                                .text_color(rgb(text_color))
+                                .child(*title),
+                        )
+                    }),
             );
         }
 
         let game = self.install().map(|install| {
             let (glyph, status, status_color) = self.game_status();
+            let tile = cover(&install.display_name, self.cover_path(install), 40., 53.);
+            if compact {
+                return div().flex().justify_center().child(tile);
+            }
             div()
                 .flex()
                 .flex_col()
                 .gap_3()
-                .child(section_label("YOUR GAME"))
+                .child(div().px_4().child(section_label("YOUR GAME")))
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .gap_3()
-                        .child(cover(&install.display_name, 40., 52., 15.))
+                        .px_4()
+                        .child(tile)
                         .child(
                             div()
                                 .flex()
@@ -755,97 +828,150 @@ impl Wizard {
                 )
         });
 
+        let footer = if self.finished.is_some() {
+            if compact { "\u{2713}".to_string() } else { "All done".to_string() }
+        } else if compact {
+            format!("{}/{}", current + 1, STEPS.len())
+        } else {
+            format!("Step {} of {}", current + 1, STEPS.len())
+        };
+
         div()
             .flex()
             .flex_col()
-            .w(px(260.))
+            .w(px(layout.sidebar_w))
             .flex_none()
             .h_full()
-            .px_4()
+            .px_3()
             .pb_5()
             .child(
-                div()
-                    .flex()
-                    .items_center()
+                Self::header_row()
+                    .px(px(if compact { 0. } else { 16. }))
+                    .when(compact, |el| el.justify_center())
                     .gap_3()
-                    .px_2()
-                    .pt_2()
-                    .pb_8()
-                    .child(img(logo()).size(px(44.)).flex_none())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .child(div().text_lg().font_weight(FontWeight::BLACK).line_height(px(20.)).child("Epic Copy"))
-                            .child(div().text_xs().text_color(rgb(MUTED)).child("Game transfer helper")),
-                    ),
+                    .child(img(logo()).size(px(40.)).flex_none())
+                    .when(!compact, |el| {
+                        el.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .child(div().text_lg().font_weight(FontWeight::BLACK).line_height(px(20.)).child("Epic Copy"))
+                                .child(div().text_xs().text_color(rgb(MUTED)).child("Game transfer helper")),
+                        )
+                    }),
             )
-            .child(nav)
             .child(div().h(px(36.)))
+            .child(nav)
+            .child(div().h(px(32.)))
             .children(game)
             .child(div().flex_1())
             .child(
                 div()
-                    .px_2()
+                    .w_full()
+                    .flex()
+                    .when(compact, |el| el.justify_center())
+                    .when(!compact, |el| el.px_4())
                     .text_xs()
                     .text_color(rgb(MUTED))
-                    .child(if self.finished.is_some() {
-                        "All done".to_string()
-                    } else {
-                        format!("Step {} of {}", current + 1, STEPS.len())
-                    }),
+                    .child(footer),
             )
     }
 
-    /// Right-hand panel: the game's tile and where it's going, like the
-    /// launcher's library card plus its filter panel.
-    fn render_game_panel(&self, install: &PendingInstall) -> Div {
-        let (glyph, status, status_color) = self.game_status();
-        let mut details = panel().w_full().child(kv("Install folder", install.install_location.display().to_string()));
+    fn game_details(&self, install: &PendingInstall) -> Div {
+        let mut details = panel().w_full().child(kv("Install folder", short_path(&install.install_location)));
         if let Some(size) = install.expected_size {
             details = details.child(kv("Game size", format_bytes(size)));
         }
-        if let Some(source) = &self.source {
-            if !source.in_place {
-                details = details.child(kv("Copying from", source.path.display().to_string()));
-            }
+        if let Some(source) = self.source.as_ref().filter(|s| !s.in_place) {
+            details = details.child(kv("Copying from", short_path(&source.path)));
         }
         if let CopyState::Done(bytes) = &self.copy {
             details = details.child(kv("Copied", format_bytes(*bytes)));
         }
+        details
+    }
 
+    fn game_title(&self, install: &PendingInstall, size: f32) -> Div {
+        let (glyph, status, status_color) = self.game_status();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_size(px(size)).font_weight(FontWeight::BOLD).child(install.display_name.clone()))
+            .when(!status.is_empty(), |el| {
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .text_sm()
+                        .text_color(rgb(status_color))
+                        .child(icon(glyph).text_size(px(12.)))
+                        .child(status),
+                )
+            })
+    }
+
+    /// The game's tile and where it's going, like a library card. Beside the
+    /// content on wide windows, a compact card above it on narrow ones.
+    fn render_game_panel(&self, install: &PendingInstall, layout: Layout) -> Div {
+        let image = self.cover_path(install);
+        if layout.stacked {
+            let (glyph, status, status_color) = self.game_status();
+            let mut facts = vec![short_path(&install.install_location)];
+            if let Some(size) = install.expected_size {
+                facts.push(format_bytes(size));
+            }
+            return div()
+                .flex()
+                .items_center()
+                .gap_4()
+                .p_3()
+                .rounded(px(12.))
+                .bg(rgb(SURFACE))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .child(cover(&install.display_name, image, 60., 80.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(div().text_base().font_weight(FontWeight::BOLD).child(install.display_name.clone()))
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(facts.join("  \u{00b7}  ")))
+                        .when(!status.is_empty(), |el| {
+                            el.child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .text_sm()
+                                    .text_color(rgb(status_color))
+                                    .child(icon(glyph).text_size(px(12.)))
+                                    .child(status),
+                            )
+                        }),
+                );
+        }
+        let w = layout.panel_w;
         div()
             .flex()
             .flex_col()
             .gap_4()
-            .w(px(280.))
+            .w(px(w))
             .flex_none()
-            .child(cover(&install.display_name, 280., 210., 64.))
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .child(div().text_lg().font_weight(FontWeight::BOLD).child(install.display_name.clone()))
-                    .when(!status.is_empty(), |el| {
-                        el.child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .text_sm()
-                                .text_color(rgb(status_color))
-                                .child(icon(glyph).text_size(px(12.)))
-                                .child(status),
-                        )
-                    }),
-            )
-            .child(details)
+            // Portrait, like the launcher's library covers.
+            .child(cover(&install.display_name, image, w, w * 4. / 3.))
+            .child(self.game_title(install, 18.))
+            .child(self.game_details(install))
     }
 }
 
 impl Render for Wizard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let layout = Layout::for_width(f32::from(window.viewport_size().width));
         let screen = match self.finished.clone() {
             Some(name) => self.render_done(&name, cx),
             None => match self.current_step() {
@@ -856,12 +982,24 @@ impl Render for Wizard {
                 _ => self.render_finish_step(cx),
             },
         };
-        let step_label = if self.finished.is_some() {
-            "Done".to_string()
+        let (pill_icon, pill_text) = if self.finished.is_some() {
+            (I_CHECK, "Done".to_string())
         } else {
-            format!("Step {} of {}", self.current_step() + 1, STEPS.len())
+            let step = self.current_step();
+            (STEP_ICONS[step.min(4)], format!("Step {} of {}  \u{00b7}  {}", step + 1, STEPS.len(), STEPS[step.min(4)]))
         };
-        let game_panel = self.install().cloned().map(|install| self.render_game_panel(&install));
+        let game_panel = self.install().cloned().map(|install| self.render_game_panel(&install, layout));
+        let (panel_above, panel_beside) = if layout.stacked { (game_panel, None) } else { (None, game_panel) };
+
+        let text_column = div()
+            .flex()
+            .flex_col()
+            .gap_6()
+            .flex_1()
+            .min_w_0()
+            .children(panel_above)
+            .children(screen.subtitle.map(para))
+            .child(screen.body);
 
         let main: AnyElement = div()
             .id("main")
@@ -873,53 +1011,44 @@ impl Render for Wizard {
                 div()
                     .flex()
                     .flex_col()
-                    .px_10()
+                    .w_full()
+                    .max_w(px(MAX_CONTENT + 2. * layout.pad))
+                    .mx_auto()
+                    .px(px(layout.pad))
                     .pb_10()
                     .child(
                         // Status pill where the launcher has its search box.
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_3()
-                            .h(px(40.))
-                            .px_5()
-                            .w(px(320.))
-                            .rounded_full()
-                            .bg(rgb(SURFACE_2))
-                            .text_sm()
-                            .text_color(rgb(TEXT_2))
-                            .child(
-                                icon(if self.finished.is_some() { I_CHECK } else { STEP_ICONS[self.current_step().min(4)] })
-                                    .text_size(px(13.)),
-                            )
-                            .child(step_label),
+                        Self::header_row().child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .h(px(40.))
+                                .px_5()
+                                .rounded_full()
+                                .bg(rgb(SURFACE_2))
+                                .text_sm()
+                                .text_color(rgb(TEXT_2))
+                                .child(icon(pill_icon).text_size(px(13.)))
+                                .child(pill_text),
+                        ),
                     )
                     .child(
                         div()
-                            .mt_8()
-                            .text_size(px(40.))
-                            .line_height(px(48.))
+                            .mt(px(36.))
+                            .text_size(px(layout.heading))
+                            .line_height(px(layout.heading * 1.2))
                             .font_weight(FontWeight::BLACK)
                             .child(screen.title),
                     )
                     .child(
                         div()
-                            .mt_8()
+                            .mt_6()
                             .flex()
                             .gap_10()
                             .items_start()
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_6()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .max_w(px(620.))
-                                    .children(screen.subtitle.map(para))
-                                    .child(screen.body),
-                            )
-                            .children(game_panel),
+                            .child(text_column)
+                            .children(panel_beside),
                     ),
             )
             .into_any_element();
@@ -931,6 +1060,6 @@ impl Render for Wizard {
             .bg(rgb(BG))
             .text_color(rgb(TEXT))
             .child(self.render_titlebar(window))
-            .child(div().flex().flex_1().min_h_0().child(self.render_sidebar()).child(main))
+            .child(div().flex().flex_1().min_h_0().child(self.render_sidebar(layout)).child(main))
     }
 }

@@ -14,6 +14,7 @@ use gpui::{
     point, prelude::*, px, size, App, Application, Bounds, Context, PathPromptOptions,
     TitlebarOptions, WindowBounds, WindowOptions,
 };
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
@@ -109,6 +110,12 @@ struct SourceCheck {
 // State
 // ---------------------------------------------------------------------------
 
+enum Cover {
+    Loading(Slot<Option<PathBuf>>),
+    /// `None`: no artwork available, use the generated tile.
+    Ready(Option<PathBuf>),
+}
+
 struct Wizard {
     manifests_dir: PathBuf,
     installs: Vec<PendingInstall>,
@@ -124,6 +131,8 @@ struct Wizard {
     copy: CopyState,
     finish_error: Option<String>,
     finished: Option<String>,
+    /// Cover art per catalog item ID.
+    covers: HashMap<String, Cover>,
     ticks: u64,
 }
 
@@ -144,6 +153,7 @@ impl Wizard {
             copy: CopyState::Idle,
             finish_error: None,
             finished: None,
+            covers: HashMap::new(),
             ticks: 0,
         };
         this.rescan();
@@ -163,8 +173,33 @@ impl Wizard {
         this
     }
 
+    /// Starts fetching cover art for games we haven't looked up yet.
+    fn load_covers(&mut self) {
+        for install in &self.installs {
+            let Some(id) = install.catalog_item_id.clone() else { continue };
+            self.covers.entry(id.clone()).or_insert_with(|| {
+                let manifests_dir = self.manifests_dir.clone();
+                Cover::Loading(in_background(move || epic::load_cover(&manifests_dir, &id)))
+            });
+        }
+    }
+
+    fn cover_path(&self, install: &PendingInstall) -> Option<PathBuf> {
+        match self.covers.get(install.catalog_item_id.as_ref()?)? {
+            Cover::Ready(path) => path.clone(),
+            Cover::Loading(_) => None,
+        }
+    }
+
     fn tick(&mut self) {
         self.ticks += 1;
+        for cover in self.covers.values_mut() {
+            if let Cover::Loading(slot) = cover {
+                if let Some(path) = take(slot) {
+                    *cover = Cover::Ready(path);
+                }
+            }
+        }
         if let Some(source) = &mut self.source {
             source.measure.poll();
         }
@@ -208,6 +243,7 @@ impl Wizard {
             Ok(installs) => {
                 self.installs = installs;
                 self.scan_error = None;
+                self.load_covers();
             }
             Err(e) => {
                 self.installs.clear();
@@ -463,7 +499,7 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(size(px(880.), px(600.))),
+                window_min_size: Some(size(px(720.), px(560.))),
                 // Draw our own title bar, like the Epic Games Launcher does.
                 titlebar: Some(TitlebarOptions {
                     title: Some("Epic Copy".into()),

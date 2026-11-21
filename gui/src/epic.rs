@@ -39,6 +39,8 @@ pub struct PendingInstall {
     pub expected_size: Option<u64>,
     /// Game executable, relative to the install folder, when the manifest says.
     pub launch_executable: Option<PathBuf>,
+    /// Epic store catalog ID, used to find the game's cover art.
+    pub catalog_item_id: Option<String>,
 }
 
 fn str_field(v: &Value, key: &str) -> String {
@@ -92,6 +94,7 @@ pub fn scan_pending(manifests_dir: &Path) -> Result<Vec<PendingInstall>, String>
                 .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
                 .filter(|&s| s > 0),
             launch_executable,
+            catalog_item_id: Some(str_field(&json, "CatalogItemId")).filter(|s| !s.is_empty()),
         });
     }
     installs.sort_by_key(|i| i.display_name.to_lowercase());
@@ -401,6 +404,89 @@ pub fn format_bytes(bytes: u64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Cover art
+// ---------------------------------------------------------------------------
+
+/// Image types in the launcher's catalog, best fit for a library tile first.
+const COVER_TYPES: [&str; 4] = ["DieselGameBoxTall", "OfferImageTall", "Thumbnail", "DieselGameBox"];
+
+/// Looks up a game's cover URL in the launcher's local catalog cache
+/// (`Data\Catalog\catcache.bin`, base64-encoded JSON).
+pub fn cover_url(catalog_cache: &[u8], item_id: &str) -> Option<String> {
+    use base64::Engine;
+    let text: Vec<u8> = catalog_cache.iter().copied().filter(|b| !b.is_ascii_whitespace()).collect();
+    let json = base64::engine::general_purpose::STANDARD.decode(text).ok()?;
+    let items: Vec<Value> = serde_json::from_slice(&json).ok()?;
+    let item = items.iter().find(|i| i.get("id").and_then(Value::as_str) == Some(item_id))?;
+    let images = item.get("keyImages")?.as_array()?;
+    COVER_TYPES.iter().find_map(|wanted| {
+        images
+            .iter()
+            .find(|img| img.get("type").and_then(Value::as_str) == Some(*wanted))
+            .and_then(|img| img.get("url")?.as_str().map(str::to_string))
+    })
+}
+
+/// Where downloaded covers are kept, so they only download once.
+pub fn cover_cache_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("EpicCopy")
+        .join("covers")
+}
+
+fn image_extension(bytes: &[u8]) -> Option<&'static str> {
+    match bytes {
+        [0x89, b'P', b'N', b'G', ..] => Some("png"),
+        [0xFF, 0xD8, 0xFF, ..] => Some("jpg"),
+        [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => Some("webp"),
+        _ => None,
+    }
+}
+
+fn cached_cover(dir: &Path, item_id: &str) -> Option<PathBuf> {
+    ["jpg", "png", "webp"].iter().map(|ext| dir.join(format!("{item_id}.{ext}"))).find(|p| p.is_file())
+}
+
+/// Returns a local file with the game's cover art: from the cache, or looked
+/// up in the launcher's catalog and downloaded from Epic's CDN. `None` when
+/// the game has no catalog entry or the download fails (the UI then falls
+/// back to a generated tile).
+pub fn load_cover(manifests_dir: &Path, item_id: &str) -> Option<PathBuf> {
+    // IDs come from a file on disk; keep them safe to use as a file name.
+    if item_id.is_empty() || !item_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return None;
+    }
+    let dir = cover_cache_dir();
+    if let Some(path) = cached_cover(&dir, item_id) {
+        return Some(path);
+    }
+    let catalog = fs::read(manifests_dir.parent()?.join("Catalog").join("catcache.bin")).ok()?;
+    let url = cover_url(&catalog, item_id)?;
+    if !url.starts_with("https://") {
+        return None;
+    }
+    // Ask the CDN for a tile-sized image instead of the full 1200x1600 one.
+    let sized = format!("{url}{}h=640&quality=high&resize=1&w=480", if url.contains('?') { '&' } else { '?' });
+    let bytes = download(&sized).or_else(|| download(&url))?;
+    let ext = image_extension(&bytes)?;
+    fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("{item_id}.{ext}"));
+    let tmp = dir.join(format!("{item_id}.part"));
+    fs::write(&tmp, &bytes).ok()?;
+    fs::rename(&tmp, &path).ok()?;
+    Some(path)
+}
+
+fn download(url: &str) -> Option<Vec<u8>> {
+    let response = ureq::get(url).timeout(std::time::Duration::from_secs(15)).call().ok()?;
+    let mut bytes = Vec::new();
+    response.into_reader().take(16 << 20).read_to_end(&mut bytes).ok()?;
+    Some(bytes)
+}
+
+// ---------------------------------------------------------------------------
 // Launcher process
 // ---------------------------------------------------------------------------
 
@@ -587,6 +673,26 @@ mod tests {
         assert!(apply(&p, &mut |_| {}).is_err());
         assert!(f.manifests.join("Pending").join("ABC.item").exists());
         assert!(f.egstore.join("Pending").join("GUID123.manifest").exists());
+    }
+
+    #[test]
+    fn finds_cover_in_catalog_cache() {
+        use base64::Engine;
+        let catalog = serde_json::json!([
+            { "id": "other", "keyImages": [{ "type": "DieselGameBoxTall", "url": "https://x/other.png" }] },
+            { "id": "abc123", "keyImages": [
+                { "type": "DieselGameBox", "url": "https://x/wide.png" },
+                { "type": "DieselGameBoxTall", "url": "https://x/tall.png" }
+            ] },
+            { "id": "wideonly", "keyImages": [{ "type": "DieselGameBox", "url": "https://x/wide2.png" }] }
+        ]);
+        let encoded = base64::engine::general_purpose::STANDARD.encode(catalog.to_string());
+        assert_eq!(cover_url(encoded.as_bytes(), "abc123").as_deref(), Some("https://x/tall.png"));
+        assert_eq!(cover_url(encoded.as_bytes(), "wideonly").as_deref(), Some("https://x/wide2.png"));
+        assert_eq!(cover_url(encoded.as_bytes(), "missing"), None);
+        assert_eq!(cover_url(b"not base64!", "abc123"), None);
+        assert_eq!(image_extension(&[0xFF, 0xD8, 0xFF, 0xE0]), Some("jpg"));
+        assert_eq!(image_extension(b"<html>"), None);
     }
 
     #[test]

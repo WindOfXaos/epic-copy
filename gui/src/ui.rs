@@ -285,6 +285,10 @@ struct Layout {
 
 /// Height of the floating title bar; columns start their content below it.
 const TITLEBAR: f32 = 32.;
+/// Breathing room between the title bar and the first row of every column.
+const HEADER_GAP: f32 = 14.;
+/// Height of the logo row / status pill row (the pill is 40px, centered).
+const HEADER_H: f32 = 44.;
 /// Longest comfortable line for paragraphs.
 const READABLE: f32 = 880.;
 
@@ -738,9 +742,10 @@ impl Wizard {
     }
 
 
-    /// Shared height for the logo row and the status pill so they line up.
+    /// Shared position for the logo row and the status pill so they line up
+    /// with each other and with the cover in the game column.
     fn header_row() -> Div {
-        div().flex().flex_none().items_center().h(px(44.)).mt(px(4.))
+        div().flex().flex_none().items_center().h(px(HEADER_H)).mt(px(HEADER_GAP))
     }
 
     fn render_sidebar(&self, layout: Layout) -> Div {
@@ -969,8 +974,30 @@ impl Wizard {
         // A full-height column on the right, like the launcher's side panels.
         // The cover lines up with the status pill at the top.
         const SIDE_PAD: f32 = 24.;
+        // Top of the cover = top of the 40px status pill in the main column.
+        let top = TITLEBAR + HEADER_GAP + (HEADER_H - 40.) / 2.;
         let w = layout.side_w - 2. * SIDE_PAD;
-        let h = (w * 4. / 3.).min(layout.height * 0.55).max(w * 0.75);
+        // Portrait 3:4 like the launcher's library covers. Images always keep
+        // their aspect ratio, so when the window is too short for a full-width
+        // cover plus the title and details, use a small cover beside the title.
+        let full_cover_fits = top + w * 4. / 3. + 300. <= layout.height;
+        let header = if full_cover_fits {
+            div()
+                .flex()
+                .flex_col()
+                .gap_4()
+                .flex_none()
+                .child(cover(&install.display_name, image, w, w * 4. / 3.))
+                .child(self.game_title(install, 20.))
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .gap_4()
+                .flex_none()
+                .child(cover(&install.display_name, image, 96., 128.))
+                .child(self.game_title(install, 18.).flex_1().min_w_0())
+        };
         div()
             .id("game-panel")
             .flex()
@@ -981,15 +1008,14 @@ impl Wizard {
             .h_full()
             .overflow_y_scroll()
             .px(px(SIDE_PAD))
-            .pt(px(TITLEBAR + 6.))
+            .pt(px(top))
             .pb(px(SIDE_PAD))
             .bg(rgb(SURFACE))
             .border_l_1()
             .border_color(rgb(BORDER))
-            // Portrait, like the launcher's library covers.
-            .child(cover(&install.display_name, image, w, h))
-            .child(self.game_title(install, 20.))
-            .child(self.game_details(install))
+            // Children keep their size; the column scrolls instead of squashing them.
+            .child(header)
+            .child(self.game_details(install).flex_none())
     }
 }
 

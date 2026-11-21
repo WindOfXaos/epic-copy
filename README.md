@@ -1,52 +1,53 @@
-# A script to transfer Epic launcher games between machines
-This script helps with transferring already downloaded games from other machines without downloading extra files or waiting for the verification process which is sometimes prone to errors.
+<p align="center">
+  <img src="assets/logo-512.png" width="112" alt="Epic Copy logo">
+</p>
 
-> **Warning**
-> USE IT AT YOUR OWN RISK! I am not responsible for the misuse of this script, backup your game data and follow the steps carefully.
+<h1 align="center">Epic Copy</h1>
 
-> **Note**
-> This script is only tested on transferring games download **FROM** Epic launcher **TO** Epic launcher
+<p align="center">
+  Add games you already have to the Epic Games Launcher, without downloading them again.
+</p>
 
-# GUI version
-<img src="gui/assets/logo-128.png" width="64" alt="Epic Copy logo">
+<p align="center">
+  <img src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white" alt="Windows 10 | 11">
+  <img src="https://img.shields.io/badge/Rust-2021-000000?logo=rust&logoColor=white" alt="Rust">
+  <img src="https://img.shields.io/badge/UI-GPUI-26BBFF" alt="GPUI">
+</p>
 
-`gui/` contains a desktop app built with [GPUI](https://www.gpui.rs/), styled after the Epic Games Launcher, that walks you through the whole transfer and does most of it for you. Instead of following the steps below by hand, run it and do what it says:
+<p align="center">
+  <img src="docs/screenshots/copying.png" alt="Copying a game into its Epic install folder">
+</p>
 
-1. **Start the download in Epic.** It opens the launcher, tells you what to click, and notices the download by itself.
-2. **Close Epic.** It detects that the launcher is still running and can close it for you.
-3. **Choose your game files.** Point it at the copy you brought (other PC, USB drive, backup). It checks the copy against Epic's manifest: whether the game's .exe is there, the expected size, and free disk space. If you pick the folder *containing* the game, it uses the game folder inside it. It also won't let you finish when only Epic's partial download is in the install folder.
-4. **Copy the files.** It copies the game into the install folder with a progress bar, skipping the other PC's `.egstore`.
-5. **Finish.** It does what `script.ps1` does, then offers to reopen Epic.
+Got a game's files from another PC, a USB drive or a backup? Epic Copy places them where the launcher expects them, then marks the install as complete, so the launcher shows **Launch** instead of downloading everything again.
 
-Build it (needs Rust and the MSVC Build Tools with the Windows SDK):
+## Features
+
+- **Guided steps.** It notices when you start the download in Epic, offers to close the launcher, and moves on by itself.
+- **Checks your copy.** It looks for the game's executable and compares the size with Epic's manifest. It also checks free disk space, and won't finish with only a partial download in place.
+- **Copies for you.** Progress is shown live, and the other PC's `.egstore` data is skipped.
+- **Several games at once.** Every unfinished download is listed, each with its own progress, and you can switch between them freely.
+- **Real cover art.** Covers come from the launcher's local catalog and are cached for offline use.
+
+<p align="center">
+  <img src="docs/screenshots/games.png" width="49%" alt="Picking a game from the unfinished downloads">
+  <img src="docs/screenshots/done.png" width="49%" alt="A finished game, with the next one waiting">
+</p>
+
+## Build
+
+Requires [Rust](https://rustup.rs) and the Visual Studio Build Tools (C++ workload and Windows SDK).
+
 ```powershell
-cd gui
-cargo build --release
-.\target\release\epic-copy.exe
+cargo run --release
 ```
-Set `EPIC_MANIFESTS_DIR` to point the app at a different manifests folder (useful for testing with fake data).
 
-# Prerequisites
-- Game files that are downloaded from Epic launcher and are up-to-date from your machine or your friend's machine.
-- Only `script.ps1` from this repository
+## How it works
 
-## Step 1
-Open Epic launcher and download the game that you are going to transfer, wait until it downloads approximately 10MB then press X to cancel the install. 
-![](/images/step1.png)
+1. Starting a download makes Epic create a pending manifest and a partial-download state (`.egstore\bps`).
+2. Epic Copy copies your game files into the install folder.
+3. It marks the pending manifest as complete, removes `bps`, and promotes the downloaded install manifest.
 
-## Step 2
-Exit Epic launcher and make sure it is not running in the task manager.
+Every check runs before anything on disk is touched. If a step fails partway through, the manifest change is rolled back.
 
-## Step 3
-Copy all files inside the game folder that you have already downloaded or copied from a friend to the install location that you have chosen previously, copy everything except `.egstore` folder.
-
-## Step 4
-Copy `script.ps1` inside the root of the install location. After copying the game files and the script it should be something like this
-![](/images/step4.png)
-
-## Step 5
-Right-click on the script and press **Run with PowerShell**, after it finishes press any key to close the window.
-![](/images/step5.png)
-
-## Step 6
-Open Epic launcher and you should see "Launch" instead of resume beneath the game.
+> [!WARNING]
+> Use at your own risk and back up your game files first. Epic Copy is an independent tool and is not affiliated with or endorsed by Epic Games.

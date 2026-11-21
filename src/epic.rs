@@ -1,10 +1,10 @@
 //! Everything that touches the disk or the launcher. The GUI in `main.rs` only
 //! decides *when* to call these.
 //!
-//! `apply` is a port of `script.ps1`: it marks a partially downloaded Epic Games
-//! Launcher install as complete so the launcher picks up game files copied in
-//! by hand. Unlike the script, every precondition is checked before anything on
-//! disk is touched, and the manifest edit is rolled back if deleting `bps` fails.
+//! `apply` marks a partially downloaded Epic Games Launcher install as complete
+//! so the launcher picks up game files copied in from elsewhere. Every
+//! precondition is checked before anything on disk is touched, and the manifest
+//! edit is rolled back if deleting `bps` fails.
 
 use serde::Serialize;
 use serde_json::Value;
@@ -160,7 +160,11 @@ fn write_tab_indented(value: &Value) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Performs the same steps as `script.ps1`, reporting each one through `log`.
+/// Marks the install complete in Epic's manifests, reporting each step
+/// through `log`:
+/// 1. clear `bIsIncompleteInstall` and move the `.item` out of `Pending`,
+/// 2. delete `.egstore\bps`,
+/// 3. move `.egstore\Pending\<InstallationGuid>.*` into `.egstore`.
 pub fn apply(plan: &Plan, log: &mut dyn FnMut(String)) -> Result<(), String> {
     if !plan.is_ready() {
         return Err(plan.problems.join("\n"));

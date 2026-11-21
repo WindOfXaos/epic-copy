@@ -1483,7 +1483,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "epic-copy-gui"
+name = "epic-copy"
 version = "0.1.0"
 dependencies = [
  "base64",

@@ -1,13 +1,9 @@
 [package]
-name = "epic-copy-gui"
+name = "epic-copy"
 version = "0.1.0"
 edition = "2021"
-description = "GPUI front-end for script.ps1: finish an Epic Games Launcher install from copied game files"
+description = "Add games you already have to the Epic Games Launcher without downloading them again"
 publish = false
-
-[[bin]]
-name = "epic-copy"
-path = "src/main.rs"
 
 [dependencies]
 gpui = "0.2"

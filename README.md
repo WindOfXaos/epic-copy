@@ -33,6 +33,10 @@ Got a game's files from another PC, a USB drive or a backup? Epic Copy places th
   <img src="docs/screenshots/done.png" width="49%" alt="A finished game, with the next one waiting">
 </p>
 
+## Download
+
+Grab the latest `EpicCopy-…-windows-x64.zip` from [Releases](../../releases/latest), unzip it and run `epic-copy.exe`. A new build is published automatically every time a change is merged into `master`.
+
 ## Build
 
 Requires [Rust](https://rustup.rs) and the Visual Studio Build Tools (C++ workload and Windows SDK).

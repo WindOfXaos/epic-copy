@@ -8,13 +8,13 @@ This script helps with transferring already downloaded games from other machines
 > This script is only tested on transferring games download **FROM** Epic launcher **TO** Epic launcher
 
 # GUI version
-`gui/` contains a desktop app built with [GPUI](https://www.gpui.rs/) that does the same thing as `script.ps1`, without having to copy a script into the game folder:
+`gui/` contains a desktop app built with [GPUI](https://www.gpui.rs/) that walks you through the whole transfer and does most of it for you. Instead of following the steps below by hand, run it and do what it says:
 
-- Lists every pending (incomplete) install the Epic launcher knows about, or lets you pick the game folder to find the matching one.
-- Checks everything up front (launcher closed, `.egstore\bps` present, pending install files present) and shows what is missing.
-- Asks for a second click before changing anything, rolls the manifest back if deleting `bps` fails, and logs every step.
-
-Follow Steps 1–3 below, then run the app instead of Steps 4–5.
+1. **Start the download in Epic.** It opens the launcher, tells you what to click, and notices the download by itself.
+2. **Close Epic.** It detects that the launcher is still running and can close it for you.
+3. **Choose your game files.** Point it at the copy you brought (other PC, USB drive, backup). It checks the copy against Epic's manifest: whether the game's .exe is there, the expected size, and free disk space. If you pick the folder *containing* the game, it uses the game folder inside it. It also won't let you finish when only Epic's partial download is in the install folder.
+4. **Copy the files.** It copies the game into the install folder with a progress bar, skipping the other PC's `.egstore`.
+5. **Finish.** It does what `script.ps1` does, then offers to reopen Epic.
 
 Build it (needs Rust and the MSVC Build Tools with the Windows SDK):
 ```powershell
